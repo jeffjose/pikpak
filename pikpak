@@ -1,0 +1,222 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "httpx",
+#   "questionary",
+# ]
+# ///
+
+import sys
+import re
+import json
+import time
+import getpass
+from pathlib import Path
+from urllib.parse import unquote_plus
+
+import httpx
+import questionary
+
+# PikPak app credentials (same ones rclone uses)
+CLIENT_ID = "YNxT9w7GMdWvEOKa"
+CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coyg"
+
+AUTH_BASE = "https://user.mypikpak.com"
+API_BASE = "https://api-drive.mypikpak.com"
+
+CONFIG_FILE = Path.home() / ".config" / "pikpak" / "config.json"
+TOKEN_CACHE = Path.home() / ".cache" / "pikpak" / "tokens.json"
+
+
+def load_config():
+    if not CONFIG_FILE.exists():
+        print(f"No config found at {CONFIG_FILE}")
+        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        username = input("PikPak username (email): ").strip()
+        password = getpass.getpass("PikPak password: ")
+        config = {"username": username, "password": password}
+        CONFIG_FILE.write_text(json.dumps(config, indent=2))
+        CONFIG_FILE.chmod(0o600)
+        print(f"Saved to {CONFIG_FILE}\n")
+        return config
+    return json.loads(CONFIG_FILE.read_text())
+
+
+def load_tokens():
+    if TOKEN_CACHE.exists():
+        return json.loads(TOKEN_CACHE.read_text())
+    return None
+
+
+def save_tokens(tokens):
+    TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    TOKEN_CACHE.write_text(json.dumps(tokens, indent=2))
+    TOKEN_CACHE.chmod(0o600)
+
+
+def login(config):
+    resp = httpx.post(
+        f"{AUTH_BASE}/v1/auth/signin",
+        json={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "username": config["username"],
+            "password": config["password"],
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    tokens = {
+        "access_token": data["access_token"],
+        "refresh_token": data["refresh_token"],
+        "expires_at": time.time() + data.get("expires_in", 86400) - 60,
+    }
+    save_tokens(tokens)
+    return tokens
+
+
+def do_refresh(tokens):
+    resp = httpx.post(
+        f"{AUTH_BASE}/v1/auth/token",
+        json={
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+        },
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    new_tokens = {
+        "access_token": data["access_token"],
+        "refresh_token": data.get("refresh_token", tokens["refresh_token"]),
+        "expires_at": time.time() + data.get("expires_in", 86400) - 60,
+    }
+    save_tokens(new_tokens)
+    return new_tokens
+
+
+def get_access_token(config):
+    tokens = load_tokens()
+    if tokens is None:
+        print("Logging in...")
+        tokens = login(config)
+    elif time.time() > tokens["expires_at"]:
+        print("Refreshing token...")
+        try:
+            tokens = do_refresh(tokens)
+        except Exception:
+            print("Refresh failed, logging in again...")
+            tokens = login(config)
+    return tokens["access_token"]
+
+
+def find_folder(access_token, name):
+    resp = httpx.get(
+        f"{API_BASE}/drive/v1/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        params={
+            "filters": json.dumps({"kind": {"eq": "drive#folder"}, "name": {"eq": name}}),
+        },
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files", [])
+    return files[0]["id"] if files else None
+
+
+def create_folder(access_token, name):
+    resp = httpx.post(
+        f"{API_BASE}/drive/v1/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"kind": "drive#folder", "name": name},
+    )
+    resp.raise_for_status()
+    return resp.json()["file"]["id"]
+
+
+def submit_magnet(access_token, magnet, folder_id):
+    resp = httpx.post(
+        f"{API_BASE}/drive/v1/files",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "kind": "drive#file",
+            "upload_type": "UPLOAD_TYPE_URL",
+            "url": {"url": magnet},
+            "parent_id": folder_id,
+            "folder_type": "DOWNLOAD",
+        },
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def extract_magnets(text):
+    pattern = r"magnet:\?[^\s\"'<>\]]+"
+    return list(dict.fromkeys(re.findall(pattern, text)))
+
+
+def label(magnet):
+    dn = re.search(r"[&?]dn=([^&]+)", magnet)
+    if dn:
+        return unquote_plus(dn.group(1))
+    return magnet[:80]
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: pikpak <folder>", file=sys.stderr)
+        print("  e.g. pikpak tvshows", file=sys.stderr)
+        print("       pikpak movies", file=sys.stderr)
+        sys.exit(1)
+
+    folder_name = sys.argv[1]
+
+    config = load_config()
+    access_token = get_access_token(config)
+
+    folder_id = find_folder(access_token, folder_name)
+    if folder_id is None:
+        print(f"Folder '{folder_name}' not found in PikPak.")
+        if questionary.confirm(f"Create it?").ask():
+            folder_id = create_folder(access_token, folder_name)
+            print(f"Created folder '{folder_name}'")
+        else:
+            sys.exit(1)
+
+    print(f"\nPaste text containing magnet links, then press Ctrl+D:")
+    try:
+        text = sys.stdin.read()
+    except KeyboardInterrupt:
+        sys.exit(0)
+
+    magnets = extract_magnets(text)
+    if not magnets:
+        print("No magnet links found.")
+        sys.exit(0)
+
+    print(f"\nFound {len(magnets)} magnet link(s).\n")
+
+    choices = [questionary.Choice(title=label(m), value=m) for m in magnets]
+    selected = questionary.checkbox(
+        f"Select to send to '{folder_name}'",
+        choices=choices,
+    ).ask()
+
+    if not selected:
+        print("Nothing selected.")
+        sys.exit(0)
+
+    print()
+    for magnet in selected:
+        name = label(magnet)
+        print(f"Submitting: {name}")
+        try:
+            submit_magnet(access_token, magnet, folder_id)
+            print("  OK")
+        except httpx.HTTPStatusError as e:
+            print(f"  ERROR {e.response.status_code}: {e.response.text}")
+
+
+if __name__ == "__main__":
+    main()
