@@ -14,6 +14,7 @@ import json
 import time
 import getpass
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote_plus
 
@@ -170,21 +171,11 @@ def list_files(access_token, parent_id=None):
 
 
 def find_folder(access_token, name, parent_id=None):
-    params = {
-        "filters": json.dumps({"kind": {"eq": "drive#folder"}, "name": {"eq": name}}),
-    }
-    if parent_id:
-        params["parent_id"] = parent_id
-    resp = httpx.get(
-        f"{API_BASE}/drive/v1/files",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params=params,
-    )
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    files = resp.json().get("files", [])
-    return files[0]["id"] if files else None
+    files = list_files(access_token, parent_id)
+    for f in files:
+        if f["kind"] == "drive#folder" and f["name"] == name:
+            return f["id"]
+    return None
 
 
 def find_folder_by_path(access_token, path):
@@ -223,16 +214,57 @@ def submit_magnet(access_token, magnet, folder_id):
     return resp.json()
 
 
-def extract_magnets(text):
-    pattern = r"magnet:\?[^\s\"'<>\]]+"
-    return list(dict.fromkeys(re.findall(pattern, text)))
+class _MagnetParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.results = []  # list of (title, magnet_url)
+        self._magnet = None
+        self._texts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            href = dict(attrs).get("href", "")
+            if href.startswith("magnet:"):
+                self._magnet = href
+                self._texts = []
+
+    def handle_data(self, data):
+        if self._magnet is not None:
+            self._texts.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self._magnet is not None:
+            text = " ".join(self._texts).strip()
+            self.results.append((text, self._magnet))
+            self._magnet = None
 
 
-def label(magnet):
+def _label_from_magnet(magnet):
     dn = re.search(r"[&?]dn=([^&]+)", magnet)
     if dn:
         return unquote_plus(dn.group(1))
     return magnet[:80]
+
+
+def extract_magnets(text):
+    """Return list of (title, magnet_url) pairs, deduped by URL."""
+    parser = _MagnetParser()
+    try:
+        parser.feed(text)
+    except Exception:
+        pass
+
+    if parser.results:
+        seen = {}
+        for title, magnet in parser.results:
+            if magnet not in seen:
+                seen[magnet] = title or _label_from_magnet(magnet)
+        return list(seen.items())
+
+    # fallback: plain text / no HTML anchor tags found
+    pattern = r"magnet:\?[^\s\"'<>\]]+"
+    magnets = list(dict.fromkeys(re.findall(pattern, text)))
+    return [(_label_from_magnet(m), m) for m in magnets]
 
 
 def cmd_ls(path=None):
@@ -312,18 +344,24 @@ def main():
     except KeyboardInterrupt:
         sys.exit(0)
 
-    magnets = extract_magnets(text)
-    if not magnets:
+    pairs = extract_magnets(text)
+    if not pairs:
         print("No magnet links found.")
         sys.exit(0)
 
-    print(f"\nFound {len(magnets)} magnet link(s).\n")
+    print(f"\nFound {len(pairs)} magnet link(s).\n")
 
-    choices = [questionary.Choice(title=label(m), value=m) for m in magnets]
-    selected = questionary.checkbox(
-        f"Select to send to '{folder_name}'",
-        choices=choices,
-    ).ask()
+    # Build a title lookup for the submit log
+    title_of = {magnet: title for title, magnet in pairs}
+
+    if len(pairs) == 1:
+        selected = [pairs[0][1]]
+    else:
+        choices = [questionary.Choice(title=title, value=magnet) for title, magnet in pairs]
+        selected = questionary.checkbox(
+            f"Select to send to '{folder_name}'",
+            choices=choices,
+        ).ask()
 
     if not selected:
         print("Nothing selected.")
@@ -331,8 +369,7 @@ def main():
 
     print()
     for magnet in selected:
-        name = label(magnet)
-        print(f"Submitting: {name}")
+        print(f"Submitting: {title_of.get(magnet, magnet[:80])}")
         try:
             submit_magnet(access_token, magnet, folder_id)
             print("  OK")
