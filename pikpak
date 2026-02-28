@@ -4,6 +4,7 @@
 # dependencies = [
 #   "httpx",
 #   "questionary",
+#   "keyring",
 # ]
 # ///
 
@@ -12,15 +13,18 @@ import re
 import json
 import time
 import getpass
+import uuid
 from pathlib import Path
 from urllib.parse import unquote_plus
 
 import httpx
+import keyring
 import questionary
 
 # PikPak app credentials (same ones rclone uses)
 CLIENT_ID = "YNxT9w7GMdWvEOKa"
 CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coyg"
+KEYRING_SERVICE = "pikpak"
 
 AUTH_BASE = "https://user.mypikpak.com"
 API_BASE = "https://api-drive.mypikpak.com"
@@ -30,17 +34,38 @@ TOKEN_CACHE = Path.home() / ".cache" / "pikpak" / "tokens.json"
 
 
 def load_config():
-    if not CONFIG_FILE.exists():
+    config = {}
+
+    if CONFIG_FILE.exists():
+        config = json.loads(CONFIG_FILE.read_text())
+
+        # migrate: remove plaintext password if it snuck in
+        if "password" in config:
+            password = config.pop("password")
+            if not keyring.get_password(KEYRING_SERVICE, config.get("username", "")):
+                keyring.set_password(KEYRING_SERVICE, config["username"], password)
+            CONFIG_FILE.write_text(json.dumps(config, indent=2))
+            print("Migrated password from config file to system keyring.")
+
+    if "username" not in config:
         print(f"No config found at {CONFIG_FILE}")
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        username = input("PikPak username (email): ").strip()
+        config["username"] = input("PikPak username (email): ").strip()
+
+    if "device_id" not in config:
+        config["device_id"] = str(uuid.uuid4())
+
+    password = keyring.get_password(KEYRING_SERVICE, config["username"])
+    if not password:
         password = getpass.getpass("PikPak password: ")
-        config = {"username": username, "password": password}
-        CONFIG_FILE.write_text(json.dumps(config, indent=2))
-        CONFIG_FILE.chmod(0o600)
-        print(f"Saved to {CONFIG_FILE}\n")
-        return config
-    return json.loads(CONFIG_FILE.read_text())
+        keyring.set_password(KEYRING_SERVICE, config["username"], password)
+        print("Password saved to system keyring.")
+
+    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    CONFIG_FILE.chmod(0o600)
+
+    config["password"] = password
+    return config
 
 
 def load_tokens():
@@ -55,7 +80,23 @@ def save_tokens(tokens):
     TOKEN_CACHE.chmod(0o600)
 
 
+def get_captcha_token(device_id, username):
+    resp = httpx.post(
+        f"{AUTH_BASE}/v1/shield/captcha/init",
+        json={
+            "client_id": CLIENT_ID,
+            "action": "POST:/v1/auth/signin",
+            "device_id": device_id,
+            "captcha_token": "",
+            "meta": {"email": username},
+        },
+    )
+    resp.raise_for_status()
+    return resp.json().get("captcha_token", "")
+
+
 def login(config):
+    captcha_token = get_captcha_token(config["device_id"], config["username"])
     resp = httpx.post(
         f"{AUTH_BASE}/v1/auth/signin",
         json={
@@ -63,6 +104,7 @@ def login(config):
             "client_secret": CLIENT_SECRET,
             "username": config["username"],
             "password": config["password"],
+            "captcha_token": captcha_token,
         },
     )
     resp.raise_for_status()
@@ -163,17 +205,38 @@ def label(magnet):
     return magnet[:80]
 
 
+def cmd_login():
+    config = load_config()
+    print(f"Logging in as {config['username']}...")
+    try:
+        login(config)
+        print("Login successful.")
+    except httpx.HTTPStatusError as e:
+        print(f"Login failed: {e.response.status_code} {e.response.json().get('error_description', e.response.text)}")
+        sys.exit(1)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage: pikpak <folder>", file=sys.stderr)
+        print("Usage:", file=sys.stderr)
+        print("  pikpak login          -- setup and verify credentials", file=sys.stderr)
+        print("  pikpak <folder>       -- submit magnet links to a folder", file=sys.stderr)
         print("  e.g. pikpak tvshows", file=sys.stderr)
         print("       pikpak movies", file=sys.stderr)
         sys.exit(1)
 
+    if sys.argv[1] == "login":
+        cmd_login()
+        return
+
     folder_name = sys.argv[1]
 
     config = load_config()
-    access_token = get_access_token(config)
+    try:
+        access_token = get_access_token(config)
+    except httpx.HTTPStatusError as e:
+        print(f"Login failed: {e.response.status_code} {e.response.json().get('error_description', e.response.text)}")
+        sys.exit(1)
 
     folder_id = find_folder(access_token, folder_name)
     if folder_id is None:
