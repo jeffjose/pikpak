@@ -258,7 +258,7 @@ def extract_magnets(text):
         for title, magnet in parser.results:
             if magnet not in seen:
                 seen[magnet] = title or _label_from_magnet(magnet)
-        return list(seen.items())
+        return [(title, magnet) for magnet, title in seen.items()]
 
     # fallback: plain text / no HTML anchor tags found
     pattern = r"magnet:\?[^\s\"'<>\]]+"
