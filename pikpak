@@ -207,7 +207,6 @@ def submit_magnet(access_token, magnet, folder_id):
             "upload_type": "UPLOAD_TYPE_URL",
             "url": {"url": magnet},
             "parent_id": folder_id,
-            "folder_type": "DOWNLOAD",
         },
     )
     resp.raise_for_status()
