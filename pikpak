@@ -343,7 +343,7 @@ def main():
     except KeyboardInterrupt:
         sys.exit(0)
 
-    pairs = extract_magnets(text)
+    pairs = sorted(extract_magnets(text), key=lambda x: x[0].lower())
     if not pairs:
         print("No magnet links found.")
         sys.exit(0)
