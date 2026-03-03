@@ -343,7 +343,11 @@ def main():
     except KeyboardInterrupt:
         sys.exit(0)
 
-    pairs = sorted(extract_magnets(text), key=lambda x: x[0].lower())
+    def _episode_key(pair):
+        m = re.search(r'[Ss](\d+)[Ee](\d+)', pair[0])
+        return (int(m.group(1)), int(m.group(2))) if m else (float('inf'), float('inf'))
+
+    pairs = sorted(extract_magnets(text), key=_episode_key)
     if not pairs:
         print("No magnet links found.")
         sys.exit(0)
