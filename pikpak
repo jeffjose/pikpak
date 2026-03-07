@@ -328,9 +328,9 @@ def main():
         print("  pikpak login               -- setup and verify credentials", file=sys.stderr)
         print("  pikpak ls [path]           -- list files/folders", file=sys.stderr)
         print("  pikpak <folder>            -- submit magnet links to a folder", file=sys.stderr)
-        print("  pikpak -f <file> <folder>  -- parse magnets from a file", file=sys.stderr)
+        print("  pikpak <folder> -f <file>  -- parse magnets from a file", file=sys.stderr)
         print("  e.g. pikpak dropbox/TV.Shows", file=sys.stderr)
-        print("       pikpak -f page.html dropbox/TV.Shows", file=sys.stderr)
+        print("       pikpak dropbox/TV.Shows -f page.html", file=sys.stderr)
         print("       pikpak dropbox/Movies", file=sys.stderr)
         sys.exit(1)
 
@@ -342,17 +342,25 @@ def main():
         cmd_ls(sys.argv[2] if len(sys.argv) > 2 else None)
         return
 
-    # Parse -f/--file flag
+    # Parse -f/--file flag (can appear before or after folder name)
     args = sys.argv[1:]
     file_path = None
-    if args[0] in ("-f", "--file"):
-        if len(args) < 3:
-            print("Usage: pikpak -f <file> <folder>", file=sys.stderr)
-            sys.exit(1)
-        file_path = args[1]
-        folder_name = args[2]
-    else:
-        folder_name = args[0]
+    remaining = []
+    i = 0
+    while i < len(args):
+        if args[i] in ("-f", "--file"):
+            if i + 1 >= len(args):
+                print("Usage: pikpak <folder> -f <file>", file=sys.stderr)
+                sys.exit(1)
+            file_path = args[i + 1]
+            i += 2
+        else:
+            remaining.append(args[i])
+            i += 1
+    if not remaining:
+        print("Usage: pikpak <folder> [-f <file>]", file=sys.stderr)
+        sys.exit(1)
+    folder_name = remaining[0]
 
     config = load_config()
     try:
