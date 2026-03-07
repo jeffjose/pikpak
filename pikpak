@@ -219,10 +219,17 @@ class _MagnetParser(HTMLParser):
         self.results = []  # list of (title, magnet_url)
         self._magnet = None
         self._texts = []
+        self._in_torrent_name = False
+        self._torrent_name = None
 
     def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        classes = attrs_dict.get("class", "").split()
+        if tag == "div" and "torrent_name" in classes:
+            self._in_torrent_name = True
+            self._texts = []
         if tag == "a":
-            href = dict(attrs).get("href", "")
+            href = attrs_dict.get("href", "")
             if href.startswith("magnet:"):
                 self._magnet = href
                 self._texts = []
@@ -230,12 +237,26 @@ class _MagnetParser(HTMLParser):
     def handle_data(self, data):
         if self._magnet is not None:
             self._texts.append(data)
+        elif self._in_torrent_name:
+            self._texts.append(data)
 
     def handle_endtag(self, tag):
+        if tag == "div" and self._in_torrent_name:
+            name = "".join(self._texts).strip()
+            if name:
+                self._torrent_name = name
+            self._texts = []
+            self._in_torrent_name = False
         if tag == "a" and self._magnet is not None:
             text = " ".join(self._texts).strip()
-            self.results.append((text, self._magnet))
+            # If the link text is just a truncated magnet URL, use the
+            # torrent_name we captured earlier or fall back to dn= param
+            if text.startswith("magnet:"):
+                text = ""
+            title = text or self._torrent_name or ""
+            self.results.append((title, self._magnet))
             self._magnet = None
+            self._torrent_name = None
 
 
 def _label_from_magnet(magnet):
@@ -307,7 +328,9 @@ def main():
         print("  pikpak login               -- setup and verify credentials", file=sys.stderr)
         print("  pikpak ls [path]           -- list files/folders", file=sys.stderr)
         print("  pikpak <folder>            -- submit magnet links to a folder", file=sys.stderr)
+        print("  pikpak -f <file> <folder>  -- parse magnets from a file", file=sys.stderr)
         print("  e.g. pikpak dropbox/TV.Shows", file=sys.stderr)
+        print("       pikpak -f page.html dropbox/TV.Shows", file=sys.stderr)
         print("       pikpak dropbox/Movies", file=sys.stderr)
         sys.exit(1)
 
@@ -319,7 +342,17 @@ def main():
         cmd_ls(sys.argv[2] if len(sys.argv) > 2 else None)
         return
 
-    folder_name = sys.argv[1]
+    # Parse -f/--file flag
+    args = sys.argv[1:]
+    file_path = None
+    if args[0] in ("-f", "--file"):
+        if len(args) < 3:
+            print("Usage: pikpak -f <file> <folder>", file=sys.stderr)
+            sys.exit(1)
+        file_path = args[1]
+        folder_name = args[2]
+    else:
+        folder_name = args[0]
 
     config = load_config()
     try:
@@ -337,11 +370,18 @@ def main():
         else:
             sys.exit(1)
 
-    print(f"\nPaste text containing magnet links, then press Ctrl+D:")
-    try:
-        text = sys.stdin.read()
-    except KeyboardInterrupt:
-        sys.exit(0)
+    if file_path:
+        try:
+            text = Path(file_path).read_text()
+        except FileNotFoundError:
+            print(f"File not found: {file_path}")
+            sys.exit(1)
+    else:
+        print(f"\nPaste text containing magnet links, then press Ctrl+D:")
+        try:
+            text = sys.stdin.read()
+        except KeyboardInterrupt:
+            sys.exit(0)
 
     def _episode_key(pair):
         m = re.search(r'[Ss](\d+)[Ee](\d+)', pair[0])
