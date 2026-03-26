@@ -6,15 +6,37 @@ A CLI tool to submit magnet links to [PikPak](https://mypikpak.com/) cloud stora
 
 - [uv](https://github.com/astral-sh/uv)
 
-Dependencies (`httpx`, `questionary`, `keyring`) are managed automatically via the inline script metadata.
+Dependencies (`httpx`, `questionary`) are managed automatically via the inline script metadata.
+
+## Setup
+
+Create a `.env` file in the project directory with your PikPak credentials:
+
+```
+PIKPAK_USERNAME=you@example.com
+PIKPAK_PASSWORD=yourpassword
+```
+
+Alternatively, set `PIKPAK_USERNAME` and `PIKPAK_PASSWORD` as environment variables (useful for CI).
+
+Tokens are cached at `~/.cache/pikpak/tokens.json` and refreshed automatically.
 
 ## Usage
 
 ```
-./pikpak login                 # set up and verify credentials
+./pikpak login                 # verify credentials
 ./pikpak ls [path]             # list files/folders
 ./pikpak <folder>              # submit magnet links to a folder
 ```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-f`, `--file <path>` | Read magnets from a file instead of stdin |
+| `--url <url1> [url2] ...` | Fetch magnets from URL(s) |
+| `-a`, `--all` | Select all found magnets (skip interactive picker) |
+| `-y`, `--yes` | Auto-confirm prompts (e.g. folder creation) |
 
 ### Examples
 
@@ -22,15 +44,14 @@ Dependencies (`httpx`, `questionary`, `keyring`) are managed automatically via t
 ./pikpak ls
 ./pikpak ls dropbox
 ./pikpak dropbox/TV.Shows
-./pikpak dropbox/Movies
+./pikpak dropbox/Movies -f magnets.html
+./pikpak dropbox/TV.Shows --url https://example.com/torrents -a -y
 ```
 
-## Setup
+### Headless / CI
 
-On first run, you will be prompted for your PikPak username and password. The password is stored in your system keyring.
+For fully non-interactive use (e.g. GitHub Actions), combine `-a -y` with `--url` or `-f`:
 
-Config is saved to `~/.config/pikpak/config.json`. Tokens are cached at `~/.cache/pikpak/tokens.json`.
-
-## Submitting magnets
-
-Run `./pikpak <folder>`, then paste any text containing magnet links and press `Ctrl+D`. The tool parses HTML anchor tags and plain text to extract magnet links with their titles. If multiple links are found, a checkbox prompt lets you choose which to submit. If only one link is found, it is submitted automatically.
+```
+./pikpak dropbox/TV.Shows --url https://example.com/page -a -y
+```

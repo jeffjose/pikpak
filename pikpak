@@ -4,15 +4,14 @@
 # dependencies = [
 #   "httpx",
 #   "questionary",
-#   "keyring",
 # ]
 # ///
 
+import os
 import sys
 import re
 import json
 import time
-import getpass
 import uuid
 import concurrent.futures
 from html.parser import HTMLParser
@@ -20,18 +19,17 @@ from pathlib import Path
 from urllib.parse import unquote_plus
 
 import httpx
-import keyring
 import questionary
 
 # PikPak app credentials (same ones rclone uses)
 CLIENT_ID = "YNxT9w7GMdWvEOKa"
 CLIENT_SECRET = "dbw2OtmVEeuUvIptb1Coyg"
-KEYRING_SERVICE = "pikpak"
 
 AUTH_BASE = "https://user.mypikpak.com"
 API_BASE = "https://api-drive.mypikpak.com"
 
-CONFIG_FILE = Path.home() / ".config" / "pikpak" / "config.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+ENV_FILE = SCRIPT_DIR / ".env"
 TOKEN_CACHE = Path.home() / ".cache" / "pikpak" / "tokens.json"
 RECENT_DIRS = Path.home() / ".cache" / "pikpak" / "recent_dirs.json"
 MAX_RECENT = 20
@@ -53,39 +51,34 @@ def save_recent_dir(folder_name):
     RECENT_DIRS.write_text(json.dumps(dirs, indent=2))
 
 
+def load_env():
+    """Load key=value pairs from .env file."""
+    env = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            key, _, value = line.partition("=")
+            env[key.strip()] = value.strip()
+    return env
+
+
 def load_config():
-    config = {}
+    env = load_env()
+    username = os.environ.get("PIKPAK_USERNAME") or env.get("PIKPAK_USERNAME")
+    password = os.environ.get("PIKPAK_PASSWORD") or env.get("PIKPAK_PASSWORD")
 
-    if CONFIG_FILE.exists():
-        config = json.loads(CONFIG_FILE.read_text())
+    if not username or not password:
+        print("Missing PIKPAK_USERNAME or PIKPAK_PASSWORD.")
+        print(f"Set them in {ENV_FILE} or as environment variables.")
+        sys.exit(1)
 
-        # migrate: remove plaintext password if it snuck in
-        if "password" in config:
-            password = config.pop("password")
-            if not keyring.get_password(KEYRING_SERVICE, config.get("username", "")):
-                keyring.set_password(KEYRING_SERVICE, config["username"], password)
-            CONFIG_FILE.write_text(json.dumps(config, indent=2))
-            print("Migrated password from config file to system keyring.")
-
-    if "username" not in config:
-        print(f"No config found at {CONFIG_FILE}")
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        config["username"] = input("PikPak username (email): ").strip()
-
-    if "device_id" not in config:
-        config["device_id"] = str(uuid.uuid4())
-
-    password = keyring.get_password(KEYRING_SERVICE, config["username"])
-    if not password:
-        password = getpass.getpass("PikPak password: ")
-        keyring.set_password(KEYRING_SERVICE, config["username"], password)
-        print("Password saved to system keyring.")
-
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
-    CONFIG_FILE.chmod(0o600)
-
-    config["password"] = password
-    return config
+    return {
+        "username": username,
+        "password": password,
+        "device_id": env.get("PIKPAK_DEVICE_ID", str(uuid.uuid4())),
+    }
 
 
 def load_tokens():
@@ -440,6 +433,8 @@ def main():
     args = sys.argv[1:]
     file_path = None
     urls = None
+    select_all = False
+    auto_yes = False
     remaining = []
     i = 0
     while i < len(args):
@@ -461,11 +456,17 @@ def main():
             if not urls:
                 print("Usage: pikpak <folder> --url <url1> [url2] ...", file=sys.stderr)
                 sys.exit(1)
+        elif args[i] in ("-a", "--all"):
+            select_all = True
+            i += 1
+        elif args[i] in ("-y", "--yes"):
+            auto_yes = True
+            i += 1
         else:
             remaining.append(args[i])
             i += 1
     if not remaining:
-        print("Usage: pikpak <folder> [-f <file>] [--url <url1> [url2] ...]", file=sys.stderr)
+        print("Usage: pikpak <folder> [-f <file>] [--url <url1> ...] [-a] [-y]", file=sys.stderr)
         sys.exit(1)
     folder_name = remaining[0]
 
@@ -503,8 +504,8 @@ def main():
     # Build a title lookup for the submit log
     title_of = {magnet: title for title, magnet in pairs}
 
-    if len(pairs) == 1:
-        selected = [pairs[0][1]]
+    if select_all or len(pairs) == 1:
+        selected = [magnet for _, magnet in pairs]
     else:
         choices = [questionary.Choice(title=title, value=magnet) for title, magnet in pairs]
         selected = questionary.checkbox(
@@ -526,7 +527,7 @@ def main():
     folder_id = find_folder_by_path(access_token, folder_name)
     if folder_id is None:
         print(f"Folder '{folder_name}' not found in PikPak.")
-        if questionary.confirm(f"Create it?").ask():
+        if auto_yes or questionary.confirm(f"Create it?").ask():
             folder_id = create_folder(access_token, folder_name)
             print(f"Created folder '{folder_name}'")
         else:
