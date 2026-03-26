@@ -14,6 +14,7 @@ import json
 import time
 import getpass
 import uuid
+import concurrent.futures
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote_plus
@@ -32,6 +33,24 @@ API_BASE = "https://api-drive.mypikpak.com"
 
 CONFIG_FILE = Path.home() / ".config" / "pikpak" / "config.json"
 TOKEN_CACHE = Path.home() / ".cache" / "pikpak" / "tokens.json"
+RECENT_DIRS = Path.home() / ".cache" / "pikpak" / "recent_dirs.json"
+MAX_RECENT = 20
+
+
+def load_recent_dirs():
+    if RECENT_DIRS.exists():
+        return json.loads(RECENT_DIRS.read_text())
+    return []
+
+
+def save_recent_dir(folder_name):
+    dirs = load_recent_dirs()
+    if folder_name in dirs:
+        dirs.remove(folder_name)
+    dirs.insert(0, folder_name)
+    dirs = dirs[:MAX_RECENT]
+    RECENT_DIRS.parent.mkdir(parents=True, exist_ok=True)
+    RECENT_DIRS.write_text(json.dumps(dirs, indent=2))
 
 
 def load_config():
@@ -287,6 +306,73 @@ def extract_magnets(text):
     return [(_label_from_magnet(m), m) for m in magnets]
 
 
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+CAPTCHA_HINTS = ["captcha", "challenge", "cf-browser-verification", "just a moment"]
+
+
+def _looks_like_captcha(text):
+    lower = text.lower()
+    return any(hint in lower for hint in CAPTCHA_HINTS)
+
+
+def fetch_url(url, retries=2, delay=3):
+    """Fetch a URL with retries. Returns HTML text or exits on failure."""
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            resp = httpx.get(
+                url,
+                headers=FETCH_HEADERS,
+                follow_redirects=True,
+                timeout=20,
+            )
+            if resp.status_code == 200 and not _looks_like_captcha(resp.text):
+                return resp.text
+            if _looks_like_captcha(resp.text):
+                last_err = f"bot protection/CAPTCHA on attempt {attempt}"
+                print(f"  Attempt {attempt}/{retries}: blocked by bot protection (status {resp.status_code})")
+            else:
+                last_err = f"HTTP {resp.status_code}"
+                print(f"  Attempt {attempt}/{retries}: HTTP {resp.status_code}")
+        except httpx.TimeoutException:
+            last_err = "timeout"
+            print(f"  Attempt {attempt}/{retries}: timed out")
+        except httpx.RequestError as e:
+            last_err = str(e)
+            print(f"  Attempt {attempt}/{retries}: {e}")
+        if attempt < retries:
+            print(f"  Retrying in {delay}s...")
+            time.sleep(delay)
+    return None
+
+
+def fetch_urls(urls):
+    """Fetch multiple URLs, combine their HTML. Returns combined text."""
+    all_text = []
+    failed = []
+    for url in urls:
+        print(f"Fetching {url} ...")
+        text = fetch_url(url)
+        if text:
+            all_text.append(text)
+            print(f"  OK ({len(text)} bytes)")
+        else:
+            failed.append(url)
+            print(f"  Failed — skipping")
+    if failed and not all_text:
+        print(f"\nAll URLs failed. The site may be blocking automated requests.")
+        print(f"Tip: save the page manually and use -f <file> instead.")
+        sys.exit(1)
+    if failed:
+        print(f"\nWarning: {len(failed)}/{len(urls)} URL(s) failed, continuing with successful ones.")
+    return "\n".join(all_text)
+
+
 def cmd_ls(path=None):
     config = load_config()
     try:
@@ -322,17 +408,25 @@ def cmd_login():
         sys.exit(1)
 
 
+def _get_auth_blocking(config):
+    """Run in a thread: returns access_token or raises."""
+    return get_access_token(config)
+
+
 def main():
     if len(sys.argv) < 2:
-        print("Usage:", file=sys.stderr)
-        print("  pikpak login               -- setup and verify credentials", file=sys.stderr)
-        print("  pikpak ls [path]           -- list files/folders", file=sys.stderr)
-        print("  pikpak <folder>            -- submit magnet links to a folder", file=sys.stderr)
-        print("  pikpak <folder> -f <file>  -- parse magnets from a file", file=sys.stderr)
-        print("  e.g. pikpak dropbox/TV.Shows", file=sys.stderr)
-        print("       pikpak dropbox/TV.Shows -f page.html", file=sys.stderr)
-        print("       pikpak dropbox/Movies", file=sys.stderr)
-        sys.exit(1)
+        recent = load_recent_dirs()
+        if not recent:
+            print("No recently used directories.", file=sys.stderr)
+            print("Usage: pikpak <folder>", file=sys.stderr)
+            sys.exit(1)
+        folder_name = questionary.select(
+            "Select a recent directory:",
+            choices=recent,
+        ).ask()
+        if not folder_name:
+            sys.exit(0)
+        sys.argv = [sys.argv[0], folder_name]
 
     if sys.argv[1] == "login":
         cmd_login()
@@ -342,9 +436,10 @@ def main():
         cmd_ls(sys.argv[2] if len(sys.argv) > 2 else None)
         return
 
-    # Parse -f/--file flag (can appear before or after folder name)
+    # Parse flags (can appear before or after folder name)
     args = sys.argv[1:]
     file_path = None
+    urls = None
     remaining = []
     i = 0
     while i < len(args):
@@ -354,31 +449,34 @@ def main():
                 sys.exit(1)
             file_path = args[i + 1]
             i += 2
+        elif args[i] == "--url":
+            if i + 1 >= len(args):
+                print("Usage: pikpak <folder> --url <url1> [url2] ...", file=sys.stderr)
+                sys.exit(1)
+            urls = []
+            i += 1
+            while i < len(args) and not args[i].startswith("-"):
+                urls.append(args[i])
+                i += 1
+            if not urls:
+                print("Usage: pikpak <folder> --url <url1> [url2] ...", file=sys.stderr)
+                sys.exit(1)
         else:
             remaining.append(args[i])
             i += 1
     if not remaining:
-        print("Usage: pikpak <folder> [-f <file>]", file=sys.stderr)
+        print("Usage: pikpak <folder> [-f <file>] [--url <url1> [url2] ...]", file=sys.stderr)
         sys.exit(1)
     folder_name = remaining[0]
 
+    # Start auth in background so user isn't blocked
     config = load_config()
-    try:
-        access_token = get_access_token(config)
-    except httpx.HTTPStatusError as e:
-        print(f"Login failed: {e.response.status_code} {e.response.json().get('error_description', e.response.text)}")
-        sys.exit(1)
-
-    folder_id = find_folder_by_path(access_token, folder_name)
-    if folder_id is None:
-        print(f"Folder '{folder_name}' not found in PikPak.")
-        if questionary.confirm(f"Create it?").ask():
-            folder_id = create_folder(access_token, folder_name)
-            print(f"Created folder '{folder_name}'")
-        else:
-            sys.exit(1)
-
-    if file_path:
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    auth_future = executor.submit(_get_auth_blocking, config)
+    # Collect user input while auth runs in background
+    if urls:
+        text = fetch_urls(urls)
+    elif file_path:
         try:
             text = Path(file_path).read_text()
         except FileNotFoundError:
@@ -417,6 +515,24 @@ def main():
     if not selected:
         print("Nothing selected.")
         sys.exit(0)
+
+    # Now wait for auth (should be done by now)
+    try:
+        access_token = auth_future.result()
+    except httpx.HTTPStatusError as e:
+        print(f"Login failed: {e.response.status_code} {e.response.json().get('error_description', e.response.text)}")
+        sys.exit(1)
+
+    folder_id = find_folder_by_path(access_token, folder_name)
+    if folder_id is None:
+        print(f"Folder '{folder_name}' not found in PikPak.")
+        if questionary.confirm(f"Create it?").ask():
+            folder_id = create_folder(access_token, folder_name)
+            print(f"Created folder '{folder_name}'")
+        else:
+            sys.exit(1)
+
+    save_recent_dir(folder_name)
 
     print()
     for magnet in selected:
