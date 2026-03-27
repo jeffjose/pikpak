@@ -294,8 +294,9 @@ def extract_magnets(text):
         return [(title, magnet) for magnet, title in seen.items()]
 
     # fallback: plain text / no HTML anchor tags found
-    pattern = r"magnet:\?[^\s\"'<>\]]+"
-    magnets = list(dict.fromkeys(re.findall(pattern, text)))
+    # Allow spaces (common in unencoded dn= values), stop at newlines
+    pattern = r"magnet:\?[^\n\r\"'<>\]]+"
+    magnets = [m.rstrip() for m in dict.fromkeys(re.findall(pattern, text))]
     return [(_label_from_magnet(m), m) for m in magnets]
 
 
