@@ -17,6 +17,7 @@ import base64
 import concurrent.futures
 from html.parser import HTMLParser
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote_plus
 
 import httpx
@@ -361,7 +362,36 @@ def _video_children(access_token, folder_id):
     ]
 
 
-def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False):
+# Renaming an entry that already synced somewhere doesn't move the copy on the
+# far side: it re-fetches the whole file under the new name and strands the old
+# one next to it. That is not theoretical — a duplicate click re-submitted an
+# already-downloaded episode, this pass renamed the *existing* PikPak entry from
+# a different release's dn, and 3.7GB came down a second time. So only touch
+# entries this run actually created.
+FRESH_SECONDS = 3600
+
+
+def _is_fresh(entry, cutoff):
+    """Whether a PikPak entry was created recently enough to still be ours.
+
+    PikPak hands back the existing file when the same magnet is submitted twice,
+    so "we just submitted it" is not the same as "it is new". The creation time
+    is what tells them apart.
+    """
+    stamp = entry.get("created_time") or ""
+    if not stamp:
+        return True  # no timestamp to judge by — treat as fresh, as before
+    try:
+        created = datetime.fromisoformat(stamp)
+    except ValueError:
+        return True
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return created >= cutoff
+
+
+def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False,
+               fresh_only=True):
     """The renames needed under a folder, as (file_id, current, desired) tuples.
 
     A multi-file torrent arrives as a folder. The folder's own name is left
@@ -377,10 +407,14 @@ def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False):
     next sync fetch the whole file again under the new name and strand the old
     one next to it.
     """
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=FRESH_SECONDS)
     plan = []
     for entry in list_files(access_token, folder_id):
         h = entry_hash(entry)
         if h not in dn_by_hash and not include_unmatched:
+            continue
+        if fresh_only and not _is_fresh(entry, cutoff):
+            print(f"Leaving {entry['name'][:60]!r} alone — it predates this run")
             continue
         dn = dn_by_hash.get(h)
 
@@ -397,7 +431,8 @@ def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False):
     return plan
 
 
-def cmd_fix(folder_name, magnets, dry_run=False, wait=0, include_unmatched=False):
+def cmd_fix(folder_name, magnets, dry_run=False, wait=0, include_unmatched=False,
+            fresh_only=True):
     """Repair the names PikPak gave this folder's downloads.
 
     Run straight after submitting, before anything syncs the folder away: a
@@ -443,7 +478,8 @@ def cmd_fix(folder_name, magnets, dry_run=False, wait=0, include_unmatched=False
         print(f"Waiting for {len(missing)} download(s) to register with PikPak...")
         time.sleep(10)
 
-    plan = plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched)
+    plan = plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched,
+                      fresh_only)
     if not plan:
         print("All names look right.")
         return
