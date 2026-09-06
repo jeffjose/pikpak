@@ -287,6 +287,23 @@ def entry_hash(entry):
     return magnet_hash(url) if url else None
 
 
+def looks_like_release(dn):
+    """Whether a dn is a real release name or a fragment of one.
+
+    A magnet whose dn wasn't percent-encoded gets truncated at the first space
+    by anything scanning for a run of non-whitespace. The hash survives, so the
+    right episode still downloads — but the name arrives as "Lioness", or "The",
+    and renaming a file to that is strictly worse than leaving whatever PikPak
+    called it. So: trust a dn that carries an episode number, or that has enough
+    separated parts to be a release name, and ignore anything else.
+    """
+    if not dn:
+        return False
+    if re.search(r"S\d{1,2}E\d{1,3}", dn, re.IGNORECASE):
+        return True
+    return len(re.split(r"[.\s_-]+", dn.strip())) >= 3
+
+
 def dotted(name):
     """A release name as it should sit on disk: whitespace collapsed to dots.
 
@@ -402,8 +419,17 @@ def cmd_fix(folder_name, magnets, dry_run=False, wait=0, include_unmatched=False
     dn_by_hash = {}
     for title, magnet in magnets:
         h = magnet_hash(magnet)
-        if h:
-            dn_by_hash[h] = _label_from_magnet(magnet) or title
+        if not h:
+            continue
+        label = _label_from_magnet(magnet) or title
+        if looks_like_release(label):
+            dn_by_hash[h] = label
+        else:
+            # Keep the hash so the entry is still considered — a missing
+            # extension is repairable from the mime type alone — but drop the
+            # name so it can't overwrite a better one.
+            print(f"Ignoring truncated-looking name {label!r} for {h[:12]}…")
+            dn_by_hash[h] = None
 
     # A freshly submitted magnet has no file yet — PikPak has to pull the
     # torrent's metadata first. Wait for the ones we were told about rather than
