@@ -168,8 +168,13 @@ def get_access_token(config):
     return tokens["access_token"]
 
 
-def list_files(access_token, parent_id=None):
+def list_files(access_token, parent_id=None, include_trashed=False):
+    # PikPak's recycle bin lives in the same listing as live files, so an
+    # unfiltered call happily returns deleted downloads — and a deleted *folder*
+    # that still matches by name, which would send new magnets into the bin.
     params = {"page_size": 100}
+    if not include_trashed:
+        params["filters"] = json.dumps({"trashed": {"eq": False}})
     if parent_id:
         params["parent_id"] = parent_id
     resp = httpx.get(
@@ -324,8 +329,6 @@ def target_name(entry, dn):
         base = base_stem
         ext = ext or base_ext
 
-    if entry.get("kind") == "drive#folder":
-        return base
     if not ext:
         ext = MIME_EXTS.get(entry.get("mime_type", ""), "")
     return base + ext
@@ -344,10 +347,12 @@ def _video_children(access_token, folder_id):
 def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False):
     """The renames needed under a folder, as (file_id, current, desired) tuples.
 
-    A multi-file torrent arrives as a folder, so the folder itself is renamed and
-    then the episode inside it. Only when there is exactly one video in there:
-    more than one means a season pack, where every file needs a *different* name
-    and the release name is the wrong answer for all of them.
+    A multi-file torrent arrives as a folder. The folder's own name is left
+    alone — Plex reads the file, not the directory, and renaming a directory
+    re-copies everything under it — so the pass reaches one level in and fixes
+    the episode itself. Only when there is exactly one video in there: more than
+    one means a season pack, where every file needs a *different* name and the
+    release name is the wrong answer for all of them.
 
     Entries we hold no magnet for are left alone unless include_unmatched. This
     is what keeps the pass to the downloads just submitted: renaming something
@@ -361,17 +366,17 @@ def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False):
         if h not in dn_by_hash and not include_unmatched:
             continue
         dn = dn_by_hash.get(h)
-        desired = target_name(entry, dn)
-        if desired and desired != entry["name"]:
-            plan.append((entry["id"], entry["name"], desired))
 
         if entry.get("kind") == "drive#folder":
             children = _video_children(access_token, entry["id"])
             if len(children) == 1:
-                child = children[0]
-                child_desired = target_name(child, dn)
-                if child_desired and child_desired != child["name"]:
-                    plan.append((child["id"], child["name"], child_desired))
+                entry = children[0]
+            else:
+                continue
+
+        desired = target_name(entry, dn)
+        if desired and desired != entry["name"]:
+            plan.append((entry["id"], entry["name"], desired))
     return plan
 
 

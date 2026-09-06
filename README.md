@@ -58,8 +58,11 @@ syncs the folder** — renaming a file that has already been copied elsewhere do
 not move the copy, it just strands the old name and re-fetches the whole file
 under the new one.
 
-A multi-file torrent arrives as a folder; the folder and the single video inside
-it are both renamed. Season packs (more than one video) are left alone.
+A multi-file torrent arrives as a folder. The folder's own name is left alone —
+Plex reads the file, not the directory, and renaming a directory re-copies
+everything under it — so `fix` reaches one level in and renames the video
+itself. Season packs (more than one video in the folder) are skipped, since each
+episode needs a different name and the release name fits none of them.
 
 | Flag | Description |
 |------|-------------|
