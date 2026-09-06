@@ -261,6 +261,12 @@ MIME_EXTS = {
 }
 
 
+# PikPak resolves a live magnet's metadata in a couple of seconds. Anything
+# still absent after that is waiting on peers, which no amount of further
+# waiting here will fix — poll tightly and give up early.
+POLL_SECONDS = 3
+
+
 def magnet_hash(magnet):
     """The info hash in a magnet as lowercase hex, or None.
 
@@ -298,7 +304,7 @@ def looks_like_release(dn):
     called it. So: trust a dn that carries an episode number, or that has enough
     separated parts to be a release name, and ignore anything else.
     """
-    if not dn:
+    if not dn or dn.lower().startswith("magnet:"):
         return False
     if re.search(r"S\d{1,2}E\d{1,3}", dn, re.IGNORECASE):
         return True
@@ -456,30 +462,70 @@ def cmd_fix(folder_name, magnets, dry_run=False, wait=0, include_unmatched=False
         h = magnet_hash(magnet)
         if not h:
             continue
-        label = _label_from_magnet(magnet) or title
-        if looks_like_release(label):
+        # Deliberately not falling back to `title`: extract_magnets uses the
+        # magnet URL itself as a label when there is no dn, and naming a file
+        # after a magnet URL is the worst outcome available.
+        label = magnet_dn(magnet)
+        if label and looks_like_release(label):
             dn_by_hash[h] = label
         else:
             # Keep the hash so the entry is still considered — a missing
             # extension is repairable from the mime type alone — but drop the
             # name so it can't overwrite a better one.
-            print(f"Ignoring truncated-looking name {label!r} for {h[:12]}…")
+            why = "carries no name" if not label else f"name looks truncated ({label!r})"
+            print(f"{h[:12]}… {why} — will only repair a missing extension")
             dn_by_hash[h] = None
 
     # A freshly submitted magnet has no file yet — PikPak has to pull the
     # torrent's metadata first. Wait for the ones we were told about rather than
     # fixing a folder that does not yet contain them.
+    #
+    # Some never arrive: a magnet with no live seeders can't yield metadata, and
+    # PikPak simply leaves the task pending. That is a normal outcome, not a
+    # failure — wait out the deadline, then fix whatever did land and say plainly
+    # which ones didn't, rather than stalling the pipeline behind a dead torrent.
     deadline = time.time() + wait
-    while dn_by_hash and time.time() < deadline:
-        present = {entry_hash(f) for f in list_files(access_token, folder_id)}
+    missing = set(dn_by_hash)
+    while dn_by_hash and missing and time.time() < deadline:
+        try:
+            present = {entry_hash(f) for f in list_files(access_token, folder_id)}
+        except httpx.HTTPError as e:
+            # A blip mid-wait shouldn't abort the pass; the next poll retries.
+            print(f"  (couldn't list PikPak: {e} — retrying)")
+            time.sleep(POLL_SECONDS)
+            continue
         missing = set(dn_by_hash) - present
         if not missing:
             break
         print(f"Waiting for {len(missing)} download(s) to register with PikPak...")
-        time.sleep(10)
+        time.sleep(POLL_SECONDS)
 
-    plan = plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched,
-                      fresh_only)
+    if missing:
+        print(f"{len(missing)} magnet(s) never registered with PikPak "
+              f"(no metadata yet — dead or slow); leaving them alone:")
+        for h in sorted(missing):
+            print(f"  {h}")
+
+    # Name what arrived. A wall of hashes says nothing about whether the right
+    # episodes landed; the names PikPak gave them say it at a glance.
+    try:
+        for entry in list_files(access_token, folder_id):
+            h = entry_hash(entry)
+            if h and h in dn_by_hash:
+                kind = "dir " if entry.get("kind") == "drive#folder" else "file"
+                print(f"  {h[:12]}… {kind} {entry['name']}")
+    except httpx.HTTPError:
+        pass
+
+    try:
+        plan = plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched,
+                          fresh_only)
+    except httpx.HTTPError as e:
+        # Naming is a nicety; the download already worked. Never turn a PikPak
+        # hiccup here into a failed pipeline step.
+        print(f"Couldn't read the folder to plan renames: {e}")
+        return
+
     if not plan:
         print("All names look right.")
         return
@@ -544,11 +590,20 @@ class _MagnetParser(HTMLParser):
             self._torrent_name = None
 
 
-def _label_from_magnet(magnet):
+def magnet_dn(magnet):
+    """The dn= a magnet carries, or None when it has none.
+
+    Distinct from _label_from_magnet, which falls back to the magnet URL itself
+    so the submit log always has something to print. A rename must never use
+    that fallback — a magnet carrying only a hash would name the file
+    "magnet:?xt=urn:btih:...".
+    """
     dn = re.search(r"[&?]dn=([^&]+)", magnet)
-    if dn:
-        return unquote_plus(dn.group(1))
-    return magnet[:80]
+    return unquote_plus(dn.group(1)) if dn else None
+
+
+def _label_from_magnet(magnet):
+    return magnet_dn(magnet) or magnet[:80]
 
 
 def extract_magnets(text):
