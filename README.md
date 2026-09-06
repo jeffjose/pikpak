@@ -27,6 +27,7 @@ Tokens are cached at `~/.cache/pikpak/tokens.json` and refreshed automatically.
 ./pikpak login                 # verify credentials
 ./pikpak ls [path]             # list files/folders
 ./pikpak <folder>              # submit magnet links to a folder
+./pikpak fix <folder>          # repair the names PikPak gave those downloads
 ```
 
 ### Flags
@@ -37,6 +38,35 @@ Tokens are cached at `~/.cache/pikpak/tokens.json` and refreshed automatically.
 | `--url <url1> [url2] ...` | Fetch magnets from URL(s) |
 | `-a`, `--all` | Select all found magnets (skip interactive picker) |
 | `-y`, `--yes` | Auto-confirm prompts (e.g. folder creation) |
+
+### `fix`
+
+PikPak names a download after whatever the torrent called itself. That is
+sometimes missing its extension (`Dark.Matter.2024.S02E02...H265-TBK` with no
+`.mkv`, which Plex ignores) and sometimes just the show (`Conan` for a 2.8 GB
+episode). The magnet's own `dn=` is reliably the release name, so `fix` renames
+against it, collapsing any spaces to dots.
+
+Feed it the same magnets you submitted:
+
+```
+echo "$MAGNETS" | ./pikpak fix dropbox/TV.Shows --wait 180
+```
+
+Only entries matching a magnet you passed are touched. **Run it before anything
+syncs the folder** — renaming a file that has already been copied elsewhere does
+not move the copy, it just strands the old name and re-fetches the whole file
+under the new one.
+
+A multi-file torrent arrives as a folder; the folder and the single video inside
+it are both renamed. Season packs (more than one video) are left alone.
+
+| Flag | Description |
+|------|-------------|
+| `-f`, `--file <path>` | Read magnets from a file instead of stdin |
+| `-n`, `--dry-run` | Print the renames without making them |
+| `--wait <seconds>` | Wait for freshly submitted downloads to register first |
+| `-A`, `--all` | Also repair missing extensions on entries with no matching magnet |
 
 ### Examples
 

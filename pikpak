@@ -13,6 +13,7 @@ import re
 import json
 import time
 import uuid
+import base64
 import concurrent.futures
 from html.parser import HTMLParser
 from pathlib import Path
@@ -225,6 +226,211 @@ def submit_magnet(access_token, magnet, folder_id):
     return resp.json()
 
 
+def rename_file(access_token, file_id, name):
+    resp = httpx.patch(
+        f"{API_BASE}/drive/v1/files/{file_id}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={"name": name},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+# What PikPak hands back for a torrent is whatever the torrent called itself,
+# and that is not always a filename. Two failure modes show up in practice: a
+# name with no extension at all (Plex ignores the file), and a name that is just
+# the show ("Conan" for a 2.8GB episode of Conan O'Brien Must Go). The magnet's
+# own dn= is reliably the release name, so it is the thing to trust.
+VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".mpg", ".mpeg", ".flv")
+
+# Only used when a name carries no extension of its own — PikPak has already
+# sniffed the container by then, so this is a lookup, not a guess.
+MIME_EXTS = {
+    "video/x-matroska": ".mkv",
+    "video/mp4": ".mp4",
+    "video/x-msvideo": ".avi",
+    "video/quicktime": ".mov",
+    "video/mp2t": ".ts",
+    "video/x-ms-wmv": ".wmv",
+}
+
+
+def magnet_hash(magnet):
+    """The info hash in a magnet as lowercase hex, or None.
+
+    Handles both spellings of xt=urn:btih: 40-char hex and 32-char base32.
+    PikPak strips dn= and every tracker off a submitted magnet and keeps only
+    this hash, so it is the only handle tying a file back to what we asked for.
+    """
+    m = re.search(r"xt=urn:btih:([A-Za-z0-9]+)", magnet, re.IGNORECASE)
+    if not m:
+        return None
+    h = m.group(1)
+    if len(h) == 40:
+        return h.lower()
+    if len(h) == 32:
+        try:
+            return base64.b32decode(h.upper()).hex()
+        except Exception:
+            return None
+    return None
+
+
+def entry_hash(entry):
+    """The info hash of the torrent a PikPak entry came from, or None."""
+    url = (entry.get("params") or {}).get("url", "")
+    return magnet_hash(url) if url else None
+
+
+def dotted(name):
+    """A release name as it should sit on disk: whitespace collapsed to dots.
+
+    Display names sometimes arrive space-separated ("Ted Lasso S04E05 Riches of
+    Embarrassment 1080p ATVP WEB-DL DDP5 1 Atmos H 264-FLUX"). Plex copes either
+    way, but the rest of the library is dot-separated, and a half-and-half
+    library is worse to scan by eye than either convention on its own.
+    """
+    name = re.sub(r"\s+", ".", name.strip())
+    return re.sub(r"\.{2,}", ".", name).strip(".")
+
+
+def split_video_ext(name):
+    """(stem, ext) when a name ends in a known video extension, else (name, "").
+
+    os.path.splitext is no use here: release names are full of dots, so it reads
+    "…H.264-playWEB" as having the extension ".264-playWEB".
+    """
+    lower = name.lower()
+    for ext in VIDEO_EXTS:
+        if lower.endswith(ext):
+            return name[: -len(ext)], name[-len(ext):]
+    return name, ""
+
+
+def target_name(entry, dn):
+    """What a PikPak entry should be called, given the magnet's dn (or None).
+
+    With a dn, that name wins outright — it is the release name, and the whole
+    reason for this pass. Without one we can still repair a missing extension,
+    which is the more common half of the problem and needs no outside knowledge.
+    """
+    current = entry["name"]
+    stem, ext = split_video_ext(current)
+
+    base = dotted(dn) if dn else stem
+    # A dn often already ends in .mkv; don't end up with ".mkv.mkv".
+    base_stem, base_ext = split_video_ext(base)
+    if base_ext:
+        base = base_stem
+        ext = ext or base_ext
+
+    if entry.get("kind") == "drive#folder":
+        return base
+    if not ext:
+        ext = MIME_EXTS.get(entry.get("mime_type", ""), "")
+    return base + ext
+
+
+def _video_children(access_token, folder_id):
+    """Video files sitting directly inside a folder."""
+    return [
+        f for f in list_files(access_token, folder_id)
+        if f.get("kind") != "drive#folder"
+        and (f.get("mime_type", "").startswith("video/")
+             or split_video_ext(f["name"])[1])
+    ]
+
+
+def plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched=False):
+    """The renames needed under a folder, as (file_id, current, desired) tuples.
+
+    A multi-file torrent arrives as a folder, so the folder itself is renamed and
+    then the episode inside it. Only when there is exactly one video in there:
+    more than one means a season pack, where every file needs a *different* name
+    and the release name is the wrong answer for all of them.
+
+    Entries we hold no magnet for are left alone unless include_unmatched. This
+    is what keeps the pass to the downloads just submitted: renaming something
+    that already synced doesn't move the copy on the far side, it just makes the
+    next sync fetch the whole file again under the new name and strand the old
+    one next to it.
+    """
+    plan = []
+    for entry in list_files(access_token, folder_id):
+        h = entry_hash(entry)
+        if h not in dn_by_hash and not include_unmatched:
+            continue
+        dn = dn_by_hash.get(h)
+        desired = target_name(entry, dn)
+        if desired and desired != entry["name"]:
+            plan.append((entry["id"], entry["name"], desired))
+
+        if entry.get("kind") == "drive#folder":
+            children = _video_children(access_token, entry["id"])
+            if len(children) == 1:
+                child = children[0]
+                child_desired = target_name(child, dn)
+                if child_desired and child_desired != child["name"]:
+                    plan.append((child["id"], child["name"], child_desired))
+    return plan
+
+
+def cmd_fix(folder_name, magnets, dry_run=False, wait=0, include_unmatched=False):
+    """Repair the names PikPak gave this folder's downloads.
+
+    Run straight after submitting, before anything syncs the folder away: a
+    rename after the copy leaves the old name behind on the far side as a
+    duplicate, so the window to fix a name cheaply is before it is ever read.
+    """
+    config = load_config()
+    try:
+        access_token = get_access_token(config)
+    except httpx.HTTPStatusError as e:
+        print(f"Login failed: {e.response.status_code} {e.response.text}")
+        sys.exit(1)
+
+    folder_id = find_folder_by_path(access_token, folder_name)
+    if folder_id is None:
+        print(f"Folder '{folder_name}' not found in PikPak.")
+        sys.exit(1)
+
+    dn_by_hash = {}
+    for title, magnet in magnets:
+        h = magnet_hash(magnet)
+        if h:
+            dn_by_hash[h] = _label_from_magnet(magnet) or title
+
+    # A freshly submitted magnet has no file yet — PikPak has to pull the
+    # torrent's metadata first. Wait for the ones we were told about rather than
+    # fixing a folder that does not yet contain them.
+    deadline = time.time() + wait
+    while dn_by_hash and time.time() < deadline:
+        present = {entry_hash(f) for f in list_files(access_token, folder_id)}
+        missing = set(dn_by_hash) - present
+        if not missing:
+            break
+        print(f"Waiting for {len(missing)} download(s) to register with PikPak...")
+        time.sleep(10)
+
+    plan = plan_fixes(access_token, folder_id, dn_by_hash, include_unmatched)
+    if not plan:
+        print("All names look right.")
+        return
+
+    for file_id, current, desired in plan:
+        print(f"{current}\n  -> {desired}")
+        if dry_run:
+            continue
+        try:
+            rename_file(access_token, file_id, desired)
+            print("  OK")
+        except httpx.HTTPStatusError as e:
+            print(f"  ERROR {e.response.status_code}: {e.response.text}")
+
+    if dry_run:
+        print(f"\n{len(plan)} rename(s) — dry run, nothing changed.")
+
+
 class _MagnetParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -428,6 +634,58 @@ def main():
 
     if sys.argv[1] == "ls":
         cmd_ls(sys.argv[2] if len(sys.argv) > 2 else None)
+        return
+
+    if sys.argv[1] == "fix":
+        args = sys.argv[2:]
+        file_path = None
+        dry_run = False
+        include_unmatched = False
+        wait = 0
+        remaining = []
+        i = 0
+        while i < len(args):
+            if args[i] in ("-f", "--file"):
+                if i + 1 >= len(args):
+                    print("Usage: pikpak fix <folder> -f <file>", file=sys.stderr)
+                    sys.exit(1)
+                file_path = args[i + 1]
+                i += 2
+            elif args[i] in ("-n", "--dry-run"):
+                dry_run = True
+                i += 1
+            elif args[i] in ("-A", "--all"):
+                include_unmatched = True
+                i += 1
+            elif args[i] == "--wait":
+                if i + 1 >= len(args):
+                    print("Usage: pikpak fix <folder> --wait <seconds>", file=sys.stderr)
+                    sys.exit(1)
+                wait = int(args[i + 1])
+                i += 2
+            else:
+                remaining.append(args[i])
+                i += 1
+        if not remaining:
+            print("Usage: pikpak fix <folder> [-f <file>] [-n] [-A] [--wait <seconds>]",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        if file_path:
+            try:
+                text = Path(file_path).read_text()
+            except FileNotFoundError:
+                print(f"File not found: {file_path}")
+                sys.exit(1)
+        elif not sys.stdin.isatty():
+            text = sys.stdin.read()
+        else:
+            # No magnets is a valid way to run this: without them the pass still
+            # repairs missing extensions, which needs nothing but the mime type.
+            text = ""
+
+        cmd_fix(remaining[0], extract_magnets(text), dry_run=dry_run, wait=wait,
+                include_unmatched=include_unmatched)
         return
 
     # Parse flags (can appear before or after folder name)
