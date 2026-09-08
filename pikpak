@@ -170,6 +170,19 @@ def get_access_token(config):
 
 
 def list_files(access_token, parent_id=None, include_trashed=False):
+    """Every entry in a folder, following next_page_token to the end.
+
+    PikPak paginates whether or not the folder is anywhere near page_size, and
+    it does not return a folder's contents in one homogeneous run: a folder of
+    21 entries came back as 10 subfolders on page one and 11 files on page two.
+    So a single-page read is not "the first 100 entries", it is an arbitrary
+    slice — and reading only page one made every file in that folder invisible.
+
+    That is not cosmetic. `fix` renames the entries it can see, so the files it
+    never listed kept the only name PikPak had for them, their info hash, and
+    `ls` reported the folder as holding nothing but directories. Seven episodes
+    of Colin From Accounts sat hash-named behind this.
+    """
     # PikPak's recycle bin lives in the same listing as live files, so an
     # unfiltered call happily returns deleted downloads — and a deleted *folder*
     # that still matches by name, which would send new magnets into the bin.
@@ -178,15 +191,28 @@ def list_files(access_token, parent_id=None, include_trashed=False):
         params["filters"] = json.dumps({"trashed": {"eq": False}})
     if parent_id:
         params["parent_id"] = parent_id
-    resp = httpx.get(
-        f"{API_BASE}/drive/v1/files",
-        headers={"Authorization": f"Bearer {access_token}"},
-        params=params,
-    )
-    if resp.status_code == 404:
-        return []
-    resp.raise_for_status()
-    return resp.json().get("files", [])
+
+    out = []
+    seen_tokens = set()
+    while True:
+        resp = httpx.get(
+            f"{API_BASE}/drive/v1/files",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+        )
+        if resp.status_code == 404:
+            return out
+        resp.raise_for_status()
+        body = resp.json()
+        out.extend(body.get("files", []))
+
+        token = body.get("next_page_token")
+        # An empty token ends the walk. A repeated one means the server is
+        # handing back the same page: stop rather than loop forever.
+        if not token or token in seen_tokens:
+            return out
+        seen_tokens.add(token)
+        params = {**params, "page_token": token}
 
 
 def find_folder(access_token, name, parent_id=None):
